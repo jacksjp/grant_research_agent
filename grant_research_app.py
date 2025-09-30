@@ -693,66 +693,6 @@ with col2:
 with st.sidebar:
     st.markdown("### 📊 Workflow Summary")
 
-    # Load saved session JSON
-    st.markdown("#### 🗂 Load Saved Session")
-    uploaded_session = st.file_uploader("Session JSON", type=['json'], key="session_loader")
-    if uploaded_session is not None:
-        try:
-            data = json.loads(uploaded_session.read().decode('utf-8'))
-            state_root = data.get('state', {})
-            # Hydrate key areas if present
-            wf = st.session_state.workflow_data
-            # Organization (from organization_verification and model outputs)
-            org_ver = state_root.get('organization_verification') or {}
-            if org_ver and 'organization' not in wf:
-                wf['organization'] = {
-                    'name': org_ver.get('confirmed_name') or org_ver.get('name') or 'Unknown Org',
-                    'location': org_ver.get('location') or org_ver.get('province') or 'Canada',
-                    'type': org_ver.get('institution_type') or org_ver.get('organization_type') or 'Organization',
-                    'research_areas': state_root.get('grant_preferences', {}).get('research_areas', []),
-                    'canada_verified': True,
-                    'source': 'imported_session'
-                }
-                st.success("Imported organization from session JSON")
-            # Grant preferences -> not directly mapped but store
-            if 'grant_preferences' in state_root:
-                wf['grant_preferences'] = state_root['grant_preferences']
-            # Eligibility assessments -> store latest as eligibility
-            elig = state_root.get('eligibility_assessments')
-            if isinstance(elig, list) and elig:
-                wf['eligibility'] = {
-                    'raw': elig[-1],
-                    'eligible': 'ELIGIBLE' in json.dumps(elig[-1]).upper(),
-                    'timestamp': datetime.now().isoformat(),
-                    'source': 'imported_session'
-                }
-            # Proposal / project: attempt to infer from last large user text block in events
-            if 'project' not in wf:
-                # Try to mine long text entries
-                events = data.get('events', [])
-                long_texts = []
-                for ev in events:
-                    content = ev.get('content', {})
-                    for part in content.get('parts', []):
-                        txt = part.get('text')
-                        if txt and len(txt) > 800:  # heuristic
-                            long_texts.append(txt)
-                if long_texts:
-                    wf['project'] = {
-                        'description': long_texts[-1][:4000],
-                        'inferred': True,
-                        'timestamp': datetime.now().isoformat(),
-                        'source': 'imported_session'
-                    }
-            # Advance step heuristically
-            if 'organization' in wf and 'grant_info' not in wf:
-                st.session_state.current_step = max(st.session_state.current_step, 2)
-            if 'grant_info' in wf and 'eligibility' in wf:
-                st.session_state.current_step = max(st.session_state.current_step, 4 if 'project' in wf else 3)
-            st.info("Session loaded. You can continue the flow.")
-        except Exception as e:
-            st.error(f"Failed to load session JSON: {e}")
-
     st.markdown("#### � Final Application Export")
     wf = st.session_state.workflow_data
     if st.button("Generate Application Document", key="export_application"):
