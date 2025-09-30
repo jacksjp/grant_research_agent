@@ -56,125 +56,239 @@ def test_adk_connection():
         return False, f"❌ ADK Error: {str(e)}"
 
 async def validate_canada_location_with_llm(org_location: str, agent_response: any, debug: bool = True) -> dict:
-    """Validate if organization is in Canada using intelligent heuristics.
+    """Validate if organization is in Canada using ONLY the ADK 2-step verification results.
+    NO FALLBACK - if ADK verification fails or is unclear, report as not in Canada.
 
     Returns structure: {"is_in_canada": bool, "confidence": level, "reasoning": str}
     """
-    # Simplified validation using location analysis
-    location = (org_location or "").lower()
     
-    # Canadian provinces and territories
-    provinces = [
-        "ontario", "quebec", "british columbia", "alberta", "manitoba", "saskatchewan",
-        "nova scotia", "new brunswick", "prince edward island", "pei", 
-        "newfoundland", "labrador", "yukon", "nunavut", "northwest territories"
-    ]
-    
-    # Major Canadian cities
-    major_cities = [
-        "toronto", "montreal", "vancouver", "calgary", "ottawa", "edmonton", 
-        "winnipeg", "halifax", "mississauga", "brampton", "hamilton", "london",
-        "kitchener", "windsor", "regina", "saskatoon", "st. johns", "fredericton",
-        "charlottetown", "victoria", "whitehorse", "yellowknife", "iqaluit"
-    ]
-    
-    # Check for explicit Canada mention
-    has_canada = "canada" in location
-    
-    # Check for province/territory
-    has_province = any(province in location for province in provinces)
-    
-    # Check for major city
-    has_major_city = any(city in location for city in major_cities)
-    
-    # Determine result
-    if has_canada or has_province:
-        confidence = "high"
-        is_in_canada = True
-        reasoning = "Location explicitly mentions Canada or Canadian province/territory"
-    elif has_major_city:
-        confidence = "medium"
-        is_in_canada = True
-        reasoning = "Location mentions major Canadian city"
+    # Convert agent response to string for processing
+    if agent_response:
+        if isinstance(agent_response, dict):
+            response_text = str(agent_response).lower()
+        else:
+            response_text = str(agent_response).lower()
     else:
-        confidence = "low"
-        is_in_canada = False
-        reasoning = "No clear Canadian location indicators found"
+        return {
+            "is_in_canada": False,
+            "confidence": "high",
+            "reasoning": "No ADK verification response received - cannot confirm Canadian location"
+        }
     
-    # Check agent response for additional context
-    if agent_response and isinstance(agent_response, dict):
-        canada_status = agent_response.get("canada_status", "")
-        if "CONFIRMED IN CANADA" in canada_status:
-            is_in_canada = True
-            confidence = "high"
-            reasoning = "Agent verification confirms Canadian location"
+    # Check for new 2-step verification results
+    if "✅ verification status: passed - organization confirmed in canada" in response_text:
+        return {
+            "is_in_canada": True,
+            "confidence": "high",
+            "reasoning": "ADK 2-step verification passed: Organization and location match verified, and location confirmed in Canada"
+        }
     
-    return {
-        "is_in_canada": is_in_canada,
-        "confidence": confidence,
-        "reasoning": reasoning
-    }
+    elif "❌ verification status: failed - organization/location mismatch" in response_text:
+        return {
+            "is_in_canada": False,
+            "confidence": "high",
+            "reasoning": "ADK 2-step verification failed: Organization name or location does not match Google search results"
+        }
+    
+    elif "❌ verification status: failed - organization not in canada" in response_text:
+        return {
+            "is_in_canada": False,
+            "confidence": "high", 
+            "reasoning": "ADK 2-step verification failed: Organization exists but is not located in Canada"
+        }
+    
+    elif "🔍 verification status: inconclusive - manual verification required" in response_text:
+        return {
+            "is_in_canada": False,
+            "confidence": "high",
+            "reasoning": "ADK verification inconclusive: Unable to verify Canadian location - treating as not in Canada"
+        }
+    
+    # Check for old format (legacy support)
+    elif "confirmed in canada" in response_text or "verification status: confirmed in canada" in response_text:
+        return {
+            "is_in_canada": True,
+            "confidence": "medium",
+            "reasoning": "Agent verification confirms Canadian location (legacy format)"
+        }
+    
+    elif "not located in canada" in response_text or "not in canada" in response_text:
+        return {
+            "is_in_canada": False,
+            "confidence": "high",
+            "reasoning": "Agent verification confirms organization is not in Canada"
+        }
+    
+    # NO FALLBACK - if we can't determine from ADK verification, treat as not in Canada
+    else:
+        return {
+            "is_in_canada": False,
+            "confidence": "high",
+            "reasoning": "ADK verification response unclear or unrecognized format - treating as not in Canada"
+        }
 
 
 async def call_adk_agent_async(agent_name: str, query: str, debug: bool = True) -> dict:
-    """Async call to ADK agents with intelligent mock responses."""
-    try:
-        from grant_research_agent.agent import root_agent
-        if debug:
-            logger.debug(f"ADK agent available, but using mock for compatibility")
-    except ImportError:
-        if debug:
-            logger.debug("ADK not available; returning mock response")
+    """Call ADK via HTTP API server with auto-discovery and session creation.
+    
+    Tries multiple app names, creates session if needed, and discovers endpoints.
+    """
+    if not ADK_AVAILABLE:
+        return {"success": False, "response": "ADK agent not available. Start ADK API server.", "error": "ADK_NOT_AVAILABLE"}
 
-    # For now, provide intelligent mock responses based on query content
-    if debug:
-        logger.debug(f"Generating mock response for {agent_name}")
+    import json, uuid
+    import requests
+
+    session_id = st.session_state.get('session_id', f"session_{uuid.uuid4().hex[:8]}")
+    user_id = st.session_state.get('user_id', 'ui_user')
     
-    # Parse organization details from the query
-    org_name = "Unknown Organization"
-    location = "Unknown Location"
-    org_type = "Unknown Type"
+    # Try multiple app names that might be configured
+    app_candidates = ['grant_research_agent', 'travel_concierge', 'grant_research']
+    base = ADK_BASE_URL.rstrip('/')
     
-    if "Organization Name:" in query:
-        lines = query.split('\n')
-        for line in lines:
-            if "Organization Name:" in line:
-                org_name = line.split(":", 1)[1].strip()
-            elif "Location:" in line:
-                location = line.split(":", 1)[1].strip()
-            elif "Institution Type:" in line:
-                org_type = line.split(":", 1)[1].strip()
+    # Auto-discover endpoints from OpenAPI if available
+    discovered_endpoints = []
+    try:
+        openapi_resp = requests.get(f"{base}/openapi.json", timeout=10)
+        if openapi_resp.status_code == 200:
+            openapi_data = openapi_resp.json()
+            paths = openapi_data.get("paths", {})
+            for path in paths:
+                if "run" in path.lower():
+                    discovered_endpoints.append(f"{base}{path}")
+                    if debug:
+                        logger.debug(f"Discovered endpoint: {base}{path}")
+    except Exception as e:
+        if debug:
+            logger.debug(f"OpenAPI discovery failed: {e}")
+
+    diagnostics = []
     
-    # Check if location appears to be in Canada
-    canada_keywords = [
-        'canada', 'ontario', 'quebec', 'british columbia', 'bc', 'alberta', 
-        'manitoba', 'saskatchewan', 'nova scotia', 'new brunswick', 'pei', 
-        'newfoundland', 'yukon', 'northwest territories', 'nunavut',
-        'toronto', 'montreal', 'vancouver', 'calgary', 'ottawa', 'edmonton', 
-        'winnipeg', 'halifax', 'mississauga', 'brampton', 'hamilton'
-    ]
+    for app_name in app_candidates:
+        # Try to create session first
+        session_url = f"{base}/apps/{app_name}/users/{user_id}/sessions/{session_id}"
+        try:
+            session_resp = requests.post(session_url, timeout=10)
+            if session_resp.status_code in [200, 201]:
+                if debug:
+                    logger.debug(f"Session created for app {app_name}")
+            diagnostics.append(f"Session {session_url}: {session_resp.status_code}")
+        except Exception as se:
+            diagnostics.append(f"Session {session_url}: ERROR {se}")
+        
+        # Build message payload
+        full_user_text = f"[AGENT:{agent_name}]\n{query}" if agent_name else query
+        payload = {
+            "session_id": session_id,
+            "app_name": app_name,
+            "user_id": user_id,
+            "new_message": {
+                "role": "user",
+                "parts": [{"text": full_user_text}]
+            }
+        }
+        
+        # Build endpoint candidates for this app
+        stream_endpoints = [
+            f"{base}/run_sse",
+            f"{base}/apps/{app_name}/users/{user_id}/sessions/{session_id}/run_sse",
+            f"{base}/apps/{app_name}/run_sse",
+        ] + [ep for ep in discovered_endpoints if "sse" in ep.lower()]
+        
+        non_stream_endpoints = [
+            f"{base}/run",
+            f"{base}/apps/{app_name}/users/{user_id}/sessions/{session_id}/run",
+            f"{base}/apps/{app_name}/run",
+        ] + [ep for ep in discovered_endpoints if "sse" not in ep.lower() and "run" in ep.lower()]
+        
+        headers = {"Content-Type": "application/json; charset=UTF-8", "Accept": "text/event-stream"}
+        
+        def parse_event_line(raw: bytes) -> str | None:
+            try:
+                line = raw.decode('utf-8').removeprefix('data: ').strip()
+                if not line or line == "[DONE]":
+                    return None
+                event = json.loads(line)
+                content = event.get("content", {})
+                parts = content.get("parts", []) if isinstance(content, dict) else []
+                if parts and isinstance(parts, list):
+                    first = parts[0]
+                    if isinstance(first, dict) and 'text' in first:
+                        return first['text']
+                return None
+            except Exception:
+                return None
+
+        aggregated = []
+        
+        # Try streaming endpoints
+        for s_url in stream_endpoints:
+            try:
+                with requests.post(s_url, data=json.dumps(payload), headers=headers, stream=True, timeout=60) as r:
+                    diagnostics.append(f"Stream {s_url}: {r.status_code}")
+                    if r.status_code == 200:
+                        for chunk in r.iter_lines():
+                            if not chunk:
+                                continue
+                            text_piece = parse_event_line(chunk)
+                            if text_piece:
+                                aggregated.append(text_piece)
+                        if aggregated:
+                            break
+            except Exception as se:
+                diagnostics.append(f"Stream {s_url}: ERROR {se}")
+        
+        # Try non-streaming endpoints if no streamed content
+        if not aggregated:
+            for n_url in non_stream_endpoints:
+                try:
+                    r2 = requests.post(n_url, json=payload, timeout=60)
+                    diagnostics.append(f"NonStream {n_url}: {r2.status_code}")
+                    if r2.status_code == 200:
+                        try:
+                            data = r2.json()
+                            if isinstance(data, dict):
+                                # Extract text from various possible response formats
+                                text_val = (data.get('text') or 
+                                          data.get('response') or 
+                                          data.get('content') or 
+                                          str(data.get('result', data)))
+                                aggregated.append(str(text_val))
+                            else:
+                                aggregated.append(str(data))
+                        except Exception:
+                            aggregated.append(r2.text)
+                        if aggregated:
+                            break
+                except Exception as ne:
+                    diagnostics.append(f"NonStream {n_url}: ERROR {ne}")
+        
+        # If we got a response with this app, return it
+        if aggregated:
+            full_response = "\n".join(aggregated).strip()
+            if debug:
+                logger.debug(f"ADK success with app {app_name}, response length={len(full_response)}")
+            
+            # Store successful app name for future use
+            if 'adk_app_name' not in st.session_state:
+                st.session_state.adk_app_name = app_name
+            
+            return {
+                "success": True, 
+                "response": full_response, 
+                "mock": False, 
+                "agent": agent_name,
+                "app_used": app_name,
+                "diagnostics": diagnostics
+            }
     
-    is_in_canada = any(keyword in location.lower() for keyword in canada_keywords)
-    
-    mock_result = {
-        "verification_status": "completed",
-        "organization_name": org_name,
-        "official_name": org_name,
-        "location": location,
-        "canada_status": "CONFIRMED IN CANADA" if is_in_canada else "LOCATION UNCLEAR",
-        "institution_type": org_type,
-        "eligibility_summary": "Eligible for Canadian grants" if is_in_canada else "Verification needed",
-        "verification_method": "Intelligent mock verification",
-        "canada_verified": is_in_canada,
-        "confidence": "high" if is_in_canada else "low",
-        "next_steps": [
-            "Proceed with grant search" if is_in_canada else "Verify Canadian location",
-            "Confirm institutional details",
-            "Review grant requirements"
-        ]
+    # If we get here, no app worked
+    return {
+        "success": False, 
+        "response": f"All ADK endpoints failed for all apps. Diagnostics: {'; '.join(diagnostics[-10:])}", 
+        "error": "ADK_HTTP_ERROR",
+        "diagnostics": diagnostics
     }
-    
-    return {"success": True, "response": mock_result, "mock": True}
 
 def call_adk_agent(agent_name: str, query: str, debug=True):
     """Synchronous wrapper for calling ADK agent."""
@@ -289,18 +403,22 @@ if st.session_state.current_step == 1:
                 
                 import textwrap
                 verification_query = textwrap.dedent(f"""
-                Please verify the following organization details and confirm it's located in Canada:
+                Please perform 2-step verification for this organization:
+                
+                Organization Details:
                 - Organization Name: {org_name}
                 - Institution Type: {org_type}
                 - Location: {org_location}
                 - Research Areas: {', '.join(research_areas) if research_areas else 'Not specified'}
 
-                Use Google search to verify:
-                1. The organization exists and is legitimate
-                2. The organization is physically located in Canada
-                3. Basic institutional details and eligibility for Canadian grants
-
-                Return verification results with Canada location confirmation.
+                STEP 1: Verify organization name and location match Google search results
+                STEP 2: Verify the location is in Canada
+                
+                Use the 2-step verification process:
+                1. First verify the organization exists at the provided location
+                2. Then verify the location is in Canada
+                
+                Return structured verification results showing both step outcomes.
                 """)
                 
                 # Show debug info
@@ -313,33 +431,59 @@ if st.session_state.current_step == 1:
                 # Call ADK agent
                 result = call_adk_agent("organization_verifier", verification_query, debug=True)
                 
-                # Show API response in debug
-                with st.expander("🔧 API Response", expanded=False):
+                # Show API response and diagnostics in debug
+                with st.expander("🔧 API Response & Diagnostics", expanded=False):
                     st.json(result)
+                    if "diagnostics" in result:
+                        st.write("**Endpoint Attempts:**")
+                        for diag in result["diagnostics"]:
+                            st.text(diag)
                 
                 if result["success"]:
                     # Use LLM to validate Canada location
-                    with st.spinner("🤖 Validating Canada location with LLM..."):
+                    with st.spinner("🤖 Validating Canada location..."):
                         validation_result = asyncio.run(validate_canada_location_with_llm(
                             org_location, result["response"], debug=st.session_state.debug_mode
                         ))
                     
                     # Show LLM validation results
-                    with st.expander("🧠 LLM Validation Results", expanded=st.session_state.debug_mode):
+                    with st.expander("🧠 Validation Results", expanded=st.session_state.debug_mode):
                         st.json(validation_result)
                     
                     is_in_canada = validation_result.get("is_in_canada", False)
                     confidence = validation_result.get("confidence", "unknown")
                     reasoning = validation_result.get("reasoning", "No reasoning provided")
                     
-                    # Display results based on LLM validation
+                    # Display results based on validation
                     if is_in_canada:
                         confidence_color = "🟢" if confidence == "high" else "🟡" if confidence == "medium" else "🟠"
                         st.success(f"✅ Organization verified as located in Canada! {confidence_color} {confidence.title()} confidence")
                         
+                        # Show detailed 2-step verification results if available
+                        response_text = str(result["response"]) if result["response"] else ""
+                        response_text_lower = response_text.lower()
+                        
+                        if "step 1 verification" in response_text_lower and "step 2 verification" in response_text_lower:
+                            st.info("**📋 2-Step Verification Results:**")
+                            
+                            # Extract step results
+                            if "step 1 verification: ✅" in response_text_lower:
+                                st.write("**Step 1:** ✅ Organization & location match confirmed")
+                            elif "step 1 verification: ❌" in response_text_lower:
+                                st.write("**Step 1:** ❌ Organization & location mismatch detected")
+                            
+                            if "step 2 verification: ✅" in response_text_lower:
+                                st.write("**Step 2:** ✅ Location confirmed in Canada")
+                            elif "step 2 verification: ❌" in response_text_lower:
+                                st.write("**Step 2:** ❌ Location not in Canada")
+                        
                         # Show reasoning
                         with st.expander("💡 Validation Reasoning"):
                             st.write(reasoning)
+                            
+                        # Show raw verification results
+                        with st.expander("📄 Detailed Verification Results"):
+                            st.text(response_text)
                         
                         # Store data
                         st.session_state.workflow_data['organization'] = {
@@ -373,11 +517,27 @@ if st.session_state.current_step == 1:
                         st.session_state.verification_complete = True
                         
                     else:
-                        st.error(f"❌ Organization does not appear to be located in Canada. ({confidence.title()} confidence)")
+                        # Enhanced failure display for 2-step verification
+                        st.error(f"❌ Organization verification failed. ({confidence.title()} confidence)")
+                        
+                        # Show detailed failure information if available
+                        response_text = str(result["response"]) if result["response"] else ""
+                        response_text_lower = response_text.lower()
+                        
+                        if "step 1 verification: ❌" in response_text_lower:
+                            st.error("**Step 1 Failed:** Organization name or location does not match Google search results")
+                        elif "step 2 verification: ❌" in response_text_lower:
+                            st.error("**Step 2 Failed:** Organization exists but is not located in Canada")
+                        elif "inconclusive" in response_text_lower:
+                            st.warning("**Verification Inconclusive:** Manual verification required")
                         
                         # Show reasoning
                         with st.expander("❓ Why was this rejected?"):
                             st.write(reasoning)
+                            
+                        # Show detailed verification results
+                        with st.expander("📄 Detailed Verification Results"):
+                            st.text(response_text)
                         
                         # Store override data for use outside form
                         st.session_state.temp_override_data = {
@@ -391,8 +551,33 @@ if st.session_state.current_step == 1:
                         }
                         st.session_state.show_override = True
                 else:
-                    st.error(f"❌ Verification failed: {result['response']}")
-                    st.error("Please check your organization details and try again, or contact support if the issue persists.")
+                    # Handle ADK errors
+                    error_type = result.get("error", "UNKNOWN")
+                    
+                    if error_type == "ADK_NOT_AVAILABLE":
+                        st.error("❌ ADK Agent Not Available")
+                        st.warning("**Issue:** The ADK (Agent Development Kit) service is not running or not connected.")
+                        st.info("**Solution:** Please ensure the ADK service is started and accessible.")
+                        
+                        with st.expander("🔧 Technical Details"):
+                            st.write(f"**ADK Endpoint:** {ADK_BASE_URL}")
+                            st.write(f"**ADK Status:** Not Available")
+                            st.write(f"**Error:** {result['response']}")
+                    
+                    elif error_type == "ADK_CALL_FAILED":
+                        st.error("❌ ADK Agent Call Failed")
+                        st.warning("**Issue:** The ADK service is available but the agent call failed.")
+                        
+                        with st.expander("🔧 Error Details"):
+                            st.write(f"**Error:** {result['response']}")
+                            st.write("This could be due to:")
+                            st.write("- Agent configuration issues")
+                            st.write("- Network connectivity problems")
+                            st.write("- Internal ADK service errors")
+                    
+                    else:
+                        st.error(f"❌ Verification failed: {result['response']}")
+                        st.error("Please check your organization details and try again, or contact support if the issue persists.")
         else:
             st.info("👆 Please enter your organization name to begin verification.")
     
